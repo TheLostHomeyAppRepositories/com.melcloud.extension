@@ -2,7 +2,11 @@ import type * as HomeyApi from 'homey-api'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type * as HomeyLib from '../../lib/homey.mts'
-import type { HomeySettings, TimestampedLog } from '../../types.mts'
+import type {
+  HomeySettings,
+  OutdoorSources,
+  TimestampedLog,
+} from '../../types.mts'
 import { changelog } from '../../files.mts'
 import { assertDefined, cast } from '../helpers.ts'
 import {
@@ -41,11 +45,33 @@ const NOTIFICATION_DELAY = 10_000
 
 const LATEST_VERSION = Object.keys(changelog).at(-1) ?? ''
 
+const SENSOR_SOURCE = 'sensor-1:measure_temperature.outdoor'
+const HOME_DEVICE_DATA = { id: 'uuid-home-1' }
+// A device whose data carries no usable MELCloud id cannot be joined to
+// a building, so it has no siblings to inherit from.
+const NO_JOIN_ID = {}
+const SHARED_BUILDING = [
+  { deviceIds: ['1000', 'uuid-home-1'], name: 'Domicile' },
+]
+const SEPARATE_BUILDINGS = [
+  { deviceIds: ['1000'], name: 'Domicile' },
+  { deviceIds: ['uuid-home-1'], name: 'Chalet' },
+]
+
 interface Harness {
   readonly apiCall: ReturnType<typeof vi.fn>
   readonly app: MELCloudExtensionApp
   readonly manager: ReturnType<typeof createMockDevicesManager>
   readonly mockHomey: MockHomey
+}
+
+// One seeding scenario: what the settings already hold, what com.melcloud
+// answers for the grouping, and the sources the app must end up with.
+interface SeedCase {
+  readonly expected: OutdoorSources
+  readonly grouping: unknown
+  readonly homeDeviceData: object
+  readonly sources: OutdoorSources
 }
 
 const createDevices = (): {
@@ -178,127 +204,80 @@ describe(MELCloudExtensionApp, () => {
     expect(mockHomey.settingsStore.outdoorSources).toStrictEqual({})
   })
 
-  it('should default a newcomer in its own building to disabled', async () => {
-    const { classicDevice, homeDevice } = createDevices()
-    const { mockHomey } = await createHarness([classicDevice, homeDevice], {
-      settings: {
-        hasSeededOutdoorSources: true,
-        outdoorSources: { 'classic-1': 'sensor-1:measure_temperature.outdoor' },
+  it.each<[string, SeedCase]>([
+    [
+      'default a newcomer in its own building to disabled',
+      {
+        expected: { 'classic-1': SENSOR_SOURCE, 'home-1': 'none' },
+        grouping: SEPARATE_BUILDINGS,
+        homeDeviceData: HOME_DEVICE_DATA,
+        sources: { 'classic-1': SENSOR_SOURCE },
       },
-    })
-    mockHomey.apiAppGet.mockReturnValue([
-      { deviceIds: ['1000'], name: 'Domicile' },
-      { deviceIds: ['uuid-home-1'], name: 'Chalet' },
-    ])
-
-    await advancePastInit()
-
-    expect(mockHomey.settingsStore.outdoorSources).toStrictEqual({
-      'classic-1': 'sensor-1:measure_temperature.outdoor',
-      'home-1': 'none',
-    })
-  })
-
-  it('should start both newcomers of a fresh building disabled', async () => {
-    const { classicDevice, homeDevice } = createDevices()
-    const { mockHomey } = await createHarness([classicDevice, homeDevice], {
-      settings: { hasSeededOutdoorSources: true, outdoorSources: {} },
-    })
-    mockHomey.apiAppGet.mockReturnValue([
-      { deviceIds: ['1000', 'uuid-home-1'], name: 'Domicile' },
-    ])
-
-    await advancePastInit()
-
-    // The sibling vote reads only pre-seed entries: neither newcomer
-    // may count the other's freshly inferred value as a decision.
-    expect(mockHomey.settingsStore.outdoorSources).toStrictEqual({
-      'classic-1': 'none',
-      'home-1': 'none',
-    })
-  })
-
-  it('should default a newcomer to disabled when no grouping is available', async () => {
-    const { classicDevice, homeDevice } = createDevices()
-    const { mockHomey } = await createHarness([classicDevice, homeDevice], {
-      settings: {
-        hasSeededOutdoorSources: true,
-        outdoorSources: { 'classic-1': null },
+    ],
+    [
+      'start both newcomers of a fresh building disabled',
+      {
+        // The sibling vote reads only pre-seed entries: neither newcomer
+        // may count the other's freshly inferred value as a decision.
+        expected: { 'classic-1': 'none', 'home-1': 'none' },
+        grouping: SHARED_BUILDING,
+        homeDeviceData: HOME_DEVICE_DATA,
+        sources: {},
       },
-    })
-    mockHomey.apiAppGet.mockReturnValue('not-a-grouping')
-
-    await advancePastInit()
-
-    expect(mockHomey.settingsStore.outdoorSources).toStrictEqual({
-      'classic-1': null,
-      'home-1': 'none',
-    })
-  })
-
-  it('should inherit the building setting for a newcomer joining it', async () => {
-    const { classicDevice, homeDevice } = createDevices()
-    const { mockHomey } = await createHarness([classicDevice, homeDevice], {
-      settings: {
-        hasSeededOutdoorSources: true,
-        outdoorSources: { 'classic-1': 'sensor-1:measure_temperature.outdoor' },
+    ],
+    [
+      'default a newcomer to disabled when no grouping is available',
+      {
+        expected: { 'classic-1': null, 'home-1': 'none' },
+        grouping: 'not-a-grouping',
+        homeDeviceData: HOME_DEVICE_DATA,
+        sources: { 'classic-1': null },
       },
-    })
-    mockHomey.apiAppGet.mockReturnValue([
-      { deviceIds: ['1000', 'uuid-home-1'], name: 'Domicile' },
-    ])
-
-    await advancePastInit()
-
-    expect(mockHomey.settingsStore.outdoorSources).toStrictEqual({
-      'classic-1': 'sensor-1:measure_temperature.outdoor',
-      'home-1': 'sensor-1:measure_temperature.outdoor',
-    })
-  })
-
-  // A device whose data carries no usable MELCloud id cannot be joined
-  // to a building, so it has no siblings to inherit from and starts
-  // disabled — the same answer as an ungrouped one.
-  it('should default a newcomer without a usable join id to disabled', async () => {
-    const { classicDevice, homeDevice } = createDevices()
-    Object.assign(homeDevice.device, { data: {} })
-    const { mockHomey } = await createHarness([classicDevice, homeDevice], {
-      settings: {
-        hasSeededOutdoorSources: true,
-        outdoorSources: { 'classic-1': 'sensor-1:measure_temperature.outdoor' },
+    ],
+    [
+      'inherit the building setting for a newcomer joining it',
+      {
+        expected: { 'classic-1': SENSOR_SOURCE, 'home-1': SENSOR_SOURCE },
+        grouping: SHARED_BUILDING,
+        homeDeviceData: HOME_DEVICE_DATA,
+        sources: { 'classic-1': SENSOR_SOURCE },
       },
-    })
-    mockHomey.apiAppGet.mockReturnValue([
-      { deviceIds: ['1000', 'uuid-home-1'], name: 'Domicile' },
-    ])
-
-    await advancePastInit()
-
-    expect(mockHomey.settingsStore.outdoorSources).toStrictEqual({
-      'classic-1': 'sensor-1:measure_temperature.outdoor',
-      'home-1': 'none',
-    })
-  })
-
-  it('should inherit the Homey-weather default from the building siblings', async () => {
-    const { classicDevice, homeDevice } = createDevices()
-    const { mockHomey } = await createHarness([classicDevice, homeDevice], {
-      settings: {
-        hasSeededOutdoorSources: true,
-        outdoorSources: { 'classic-1': null },
+    ],
+    [
+      'default a newcomer without a usable join id to disabled',
+      {
+        // Unjoinable, so it starts disabled — the same answer as an
+        // ungrouped one, even though its building shares a source.
+        expected: { 'classic-1': SENSOR_SOURCE, 'home-1': 'none' },
+        grouping: SHARED_BUILDING,
+        homeDeviceData: NO_JOIN_ID,
+        sources: { 'classic-1': SENSOR_SOURCE },
       },
-    })
-    mockHomey.apiAppGet.mockReturnValue([
-      { deviceIds: ['1000', 'uuid-home-1'], name: 'Domicile' },
-    ])
+    ],
+    [
+      'inherit the Homey-weather default from the building siblings',
+      {
+        expected: { 'classic-1': null, 'home-1': null },
+        grouping: SHARED_BUILDING,
+        homeDeviceData: HOME_DEVICE_DATA,
+        sources: { 'classic-1': null },
+      },
+    ],
+  ])(
+    'should %s',
+    async (_description, { expected, grouping, homeDeviceData, sources }) => {
+      const { classicDevice, homeDevice } = createDevices()
+      Object.assign(homeDevice.device, { data: homeDeviceData })
+      const { mockHomey } = await createHarness([classicDevice, homeDevice], {
+        settings: { hasSeededOutdoorSources: true, outdoorSources: sources },
+      })
+      mockHomey.apiAppGet.mockReturnValue(grouping)
 
-    await advancePastInit()
+      await advancePastInit()
 
-    expect(mockHomey.settingsStore.outdoorSources).toStrictEqual({
-      'classic-1': null,
-      'home-1': null,
-    })
-  })
+      expect(mockHomey.settingsStore.outdoorSources).toStrictEqual(expected)
+    },
+  )
 
   it('should re-read the grouping on demand, following a rename', async () => {
     const { classicDevice } = createDevices()
